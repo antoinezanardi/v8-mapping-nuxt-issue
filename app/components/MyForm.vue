@@ -23,10 +23,9 @@ function onSubmit(event: FormSubmitEvent<FormData>): void {
 }
 
 async function triggerFormSubmit(): Promise<void> {
-  if (!form.value) {
-    return;
+  if (form.value) {
+    await form.value.submit();
   }
-  await form.value.submit();
 }
 
 defineExpose({ triggerFormSubmit });

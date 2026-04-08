@@ -1,8 +1,11 @@
-# V8 Coverage Source Map Drift in Vue SFC with Nuxt + @nuxt/ui
+# V8 Coverage Source Map Drift in Vue SFC with @nuxt/ui
 
 ## Description
 
-V8 code coverage reports **false uncovered lines, phantom "if" branches, and incorrect function mappings** in Vue Single File Components (SFCs) when the Nuxt Vite plugin chain processes them. All tests pass, all code paths are exercised, yet `@vitest/coverage-v8` reports less than 100% coverage.
+When `@nuxt/ui` is loaded as a Nuxt module, V8 code coverage reports a **phantom "if" branch** in Vue Single File Components (SFCs). All tests pass, every line/statement/function
+is fully covered, yet `@vitest/coverage-v8` reports **50% branch coverage** because of a ghost branch mapped to a line that contains no conditional.
+
+**The issue is caused by `@nuxt/ui`** — removing it from `nuxt.config.ts` makes coverage reporting accurate. Nuxt itself (without `@nuxt/ui`) does not exhibit this problem.
 
 ## Reproduction
 
@@ -23,74 +26,113 @@ All 4 tests pass, but coverage reports:
 ------------|---------|----------|---------|---------|-------------------
 File        | % Stmts | % Branch | % Funcs | % Lines | Uncovered Line #s
 ------------|---------|----------|---------|---------|-------------------
- MyForm.vue |   92.85 |       50 |     100 |    92.3 | 30
+ MyForm.vue |     100 |       50 |     100 |     100 | 29
 ------------|---------|----------|---------|---------|-------------------
+ERROR: Coverage for branches (50%) does not meet global threshold (100%)
 ```
 
-- **Line 30** (`}` — closing brace of `triggerFormSubmit`) is reported as uncovered, but the function is called and tested
-- **Branches: 50%** — a phantom `"if"` branch appears in `coverage-final.json` at a line that has no `if` statement in the source
-- **Statements: 92.85%** — a statement is falsely reported as uncovered
+- **Branches: 50%** — a phantom `"if"` branch appears at line 29, but line 29 in the source is `}` (the closing brace of `triggerFormSubmit`), not an `if` statement
+- The actual `if (form.value)` is on **line 26** — the branch location has drifted by **+3 lines**
+- Statements, functions, and lines are all **100%** — only the branch position is wrong
 
 ## Root Cause Analysis
 
-The issue is a **source map position drift** in the multi-step Vite transform pipeline for Vue SFCs:
+### It's `@nuxt/ui`, not Nuxt
 
-1. `@vitejs/plugin-vue` compiles the SFC (script setup + inline template) -> source map #1
-2. `esbuild` strips TypeScript type annotations -> source map #2 (chained with #1)
-3. Nuxt's `unimport` plugin injects auto-import statements at the top of the file -> source map #3 (chained with #2)
-4. `@nuxt/ui` registers additional component auto-imports -> more transform layers
+Removing `@nuxt/ui` from `modules` in `nuxt.config.ts` and replacing the Nuxt UI components with plain HTML equivalents (while keeping the identical `<script setup>` logic)produces
+**accurate** coverage reporting — branch coverage is 100%.
 
-Each chaining step can introduce position errors. When V8 coverage data is mapped back through the final chained source map, the accumulated errors cause:
+### Source Map Position Drift
 
-- **Functions mapped to wrong line numbers** (e.g., `onSubmit` at line 25 in source gets mapped to line 28+ in coverage)
-- **Phantom "if" branches** — compiled template cache expressions (`_cache[N] || (...)`) map back to incorrect source positions, creating `type: "if"` branches where none exist
-- **Statements reported as uncovered** at wrong positions
+The source map drift manifests as a **3-line shift** for the branch position:
+
+| Coverage data        | Reported source position | Actual source position      | Shift    |
+|----------------------|--------------------------|-----------------------------|----------|
+| `if` branch location | Line 29 (`}`)            | Line 26 (`if (form.value)`) | +3 lines |
+
+### Vite Transform Pipeline
+
+Instrumentation of the Vite plugin pipeline reveals the following transform chain for `MyForm.vue`:
+
+| Order | Plugin                   | Enforce | Effect                                                                                              |
+|-------|--------------------------|---------|-----------------------------------------------------------------------------------------------------|
+| 1     | `@vitejs/plugin-vue`     | `pre`   | Compiles SFC (`<script setup>` + `<template>`) into JS with render function. Produces source map #1 |
+| 2     | `vite:esbuild`           | —       | Strips TypeScript type annotations. Produces source map #2 (chained with #1)                        |
+| 3     | `nuxt:imports-transform` | `post`  | Injects auto-import for `useTemplateRef` from `vue`. Produces source map #3 (chained with #2)       |
+
+When `@nuxt/ui` is loaded, it registers additional Vite plugins (`@tailwindcss/vite`, `unplugin-vue-components`, `unplugin-auto-import`, and several `nuxt:ui:*` plugins). While *
+*none of these plugins directly transform `MyForm.vue`** (verified by instrumentation), their presence in the plugin pipeline alters how Vite processes and chains source maps
+through `@ampproject/remapping`.
+
+The result is that the final chained source map contains incorrect position data for the `triggerFormSubmit` function body, causing V8 coverage byte offsets to map the `if` branch
+to the wrong source line.
 
 ### Evidence from `coverage-final.json`
 
-After running `pnpm run test:coverage`, inspect `coverage/coverage-final.json`:
+With `@nuxt/ui` loaded:
 
 ```json
 {
   "branchMap": {
-    "0": { "type": "if", "loc": { "start": { "line": 29 } } }
+    "0": {
+      "type": "if",
+      "loc": {
+        "start": {
+          "line": 29,
+          "column": 0
+        }
+      }
+    }
   },
   "b": {
-    "0": [0, 1]
+    "0": [
+      1,
+      0
+    ]
   }
 }
 ```
 
-Line 29 in the source is `await form.value.submit();` — there is no `if` statement there. The phantom branch comes from the compiled template's cache conditional being incorrectly source-mapped.
+Line 29 in source is `}` — the closing brace of `triggerFormSubmit`. The `if (form.value)` is on line 26. The branch counts `[1, 0]` indicate one path was taken and the other was
+not, yet both paths are exercised in the tests (the truthy path submits the form; the falsy path is the implicit else of a single-branch `if`).
 
-### What does NOT trigger the bug
+Without `@nuxt/ui`, no phantom branch is reported and coverage is 100%.
 
-Removing `defineExpose` + `useTemplateRef` + `triggerFormSubmit` while keeping the rest identical makes coverage report 100%. The additional code complexity from these constructs creates enough source map surface area for the chaining drift to manifest.
+### Key Finding: `unplugin-vue-components` does NOT transform the file
 
-### Standalone SFC compilation is correct
+Through pipeline instrumentation, I confirmed that `unplugin-vue-components` (registered by `@nuxt/ui`) does **not** actually modify `MyForm.vue` — the `_resolveComponent()` calls
+remain in the final output. The only plugin that transforms the file is Nuxt's own `nuxt:imports-transform`.
 
-Compiling the same SFC with `@vue/compiler-sfc` + `esbuild` directly (outside the Nuxt plugin chain) produces **correct source maps**. The bug only manifests when the full Nuxt Vite plugin chain runs with its additional transform layers.
+However, the mere **presence** of `@nuxt/ui`'s plugins in the Vite pipeline affects the source map chaining outcome. This suggests the issue is in how Vite's`@ampproject/remapping`
+handles the source map chain when additional (non-transforming) plugins are registered.
 
 ## Environment
 
-| Package | Version |
-|---------|---------|
-| nuxt | 4.4.2 |
-| @nuxt/ui | 3.1.3+ |
-| vitest | 4.1.3 |
-| @vitest/coverage-v8 | 4.1.3 |
-| @vitejs/plugin-vue | 6.0.5 |
-| vue | 3.5.30 |
-| vite | 7.3.1 |
-| Node.js | 25.8.1+ |
+| Package                 | Version |
+|-------------------------|---------|
+| nuxt                    | 4.4.2   |
+| @nuxt/ui                | 3.3.7   |
+| vitest                  | 4.1.3   |
+| @vitest/coverage-v8     | 4.1.3   |
+| vue                     | 3.5.32  |
+| vite                    | 7.3.2   |
+| unplugin-vue-components | 30.0.0  |
+| unplugin-auto-import    | 20.3.0  |
 
 ## Minimal Trigger Conditions
 
-The bug requires all of these in the same SFC:
-- `@nuxt/ui` module loaded (provides UForm, UFormField, UInput auto-imports + additional Vite transforms)
+All of these are required simultaneously in the same SFC:
+
+- `@nuxt/ui` module loaded in `nuxt.config.ts`
 - `useTemplateRef` referencing a template element
 - `defineExpose` exposing a function
 - An async function with an `if` guard (e.g., `triggerFormSubmit`)
 - A template using Nuxt UI components (`UForm`, `UFormField`, `UInput`)
 
-Removing any one of `defineExpose`, `useTemplateRef`, or the `triggerFormSubmit` function eliminates the bug.
+Removing any one of `defineExpose`, `useTemplateRef`, or the async function with guard eliminates the misreported coverage.
+
+## Related Issues
+
+- [`unplugin-vue-components#333`](https://github.com/unplugin/unplugin-vue-components/issues/333) — "Vite plugin breaks vitest coverage report" (open since March 2022)
+- [`unplugin-vue-components#219`](https://github.com/unplugin/unplugin-vue-components/issues/219) — "this plugin destroy sourcemap" (open since November 2021)
+- No existing issues on `nuxt/ui` for this problem
