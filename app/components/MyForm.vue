@@ -24,6 +24,7 @@ function onSubmit(event: FormSubmitEvent<FormData>): void {
 
 async function triggerFormSubmit(): Promise<void> {
   if (form.value) {
+    console.log("Form ref is available, submitting form...");
     await form.value.submit();
   }
 }

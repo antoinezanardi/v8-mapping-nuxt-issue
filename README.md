@@ -34,13 +34,18 @@ ERROR: Coverage for branches (50%) does not meet global threshold (100%)
 - **Branches: 50%** — a phantom `"if"` branch appears at line 29, but line 29 in the source is `}` (the closing brace of `triggerFormSubmit`), not an `if` statement
 - The actual `if (form.value)` is on **line 26** — the branch location has drifted by **+3 lines**
 - Statements, functions, and lines are all **100%** — only the branch position is wrong
+- A `console.log` inside the `if` body (line 27) **prints during the test run**, proving the branch IS exercised:
+
+```
+stdout | app/components/MyForm.spec.ts > MyForm > should emit submitData when the form is submitted with valid data.
+Form ref is available, submitting form...
+```
 
 ## Root Cause Analysis
 
 ### It's `@nuxt/ui`, not Nuxt
 
-Removing `@nuxt/ui` from `modules` in `nuxt.config.ts` and replacing the Nuxt UI components with plain HTML equivalents (while keeping the identical `<script setup>` logic)produces
-**accurate** coverage reporting — branch coverage is 100%.
+Removing `@nuxt/ui` from `modules` in `nuxt.config.ts` and replacing the Nuxt UI components with plain HTML equivalents (while keeping the identical `<script setup>` logic) produces **accurate** coverage reporting — branch coverage is 100%.
 
 ### Source Map Position Drift
 
@@ -60,9 +65,7 @@ Instrumentation of the Vite plugin pipeline reveals the following transform chai
 | 2     | `vite:esbuild`           | —       | Strips TypeScript type annotations. Produces source map #2 (chained with #1)                        |
 | 3     | `nuxt:imports-transform` | `post`  | Injects auto-import for `useTemplateRef` from `vue`. Produces source map #3 (chained with #2)       |
 
-When `@nuxt/ui` is loaded, it registers additional Vite plugins (`@tailwindcss/vite`, `unplugin-vue-components`, `unplugin-auto-import`, and several `nuxt:ui:*` plugins). While *
-*none of these plugins directly transform `MyForm.vue`** (verified by instrumentation), their presence in the plugin pipeline alters how Vite processes and chains source maps
-through `@ampproject/remapping`.
+When `@nuxt/ui` is loaded, it registers additional Vite plugins (`@tailwindcss/vite`, `unplugin-vue-components`, `unplugin-auto-import`, and several `nuxt:ui:*` plugins). While **none of these plugins directly transform `MyForm.vue`** (verified by instrumentation), their presence in the plugin pipeline alters how Vite processes and chains source maps through `@ampproject/remapping`.
 
 The result is that the final chained source map contains incorrect position data for the `triggerFormSubmit` function body, causing V8 coverage byte offsets to map the `if` branch
 to the wrong source line.
@@ -103,8 +106,7 @@ Without `@nuxt/ui`, no phantom branch is reported and coverage is 100%.
 Through pipeline instrumentation, I confirmed that `unplugin-vue-components` (registered by `@nuxt/ui`) does **not** actually modify `MyForm.vue` — the `_resolveComponent()` calls
 remain in the final output. The only plugin that transforms the file is Nuxt's own `nuxt:imports-transform`.
 
-However, the mere **presence** of `@nuxt/ui`'s plugins in the Vite pipeline affects the source map chaining outcome. This suggests the issue is in how Vite's`@ampproject/remapping`
-handles the source map chain when additional (non-transforming) plugins are registered.
+However, the mere **presence** of `@nuxt/ui`'s plugins in the Vite pipeline affects the source map chaining outcome. This suggests the issue is in how Vite's `@ampproject/remapping` handles the source map chain when additional (non-transforming) plugins are registered.
 
 ## Environment
 
